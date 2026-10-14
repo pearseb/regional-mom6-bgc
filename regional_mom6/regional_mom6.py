@@ -216,6 +216,73 @@ copernicusmarine subset --dataset-id cmems_mod_glo_phy_my_0.083deg_P1D-m --varia
     file.close()
     return Path(path / "get_glorys_data.pbs")
 
+def get_bgc_data(
+    longitude_extent,
+    latitude_extent,
+    timerange,
+    segment_name,
+    download_path,
+    dataset_id,
+    variables,
+    modify_existing=True,
+    project=None,
+):
+    """
+    Generates a bash script to download all of the required ocean biogeochemical forcing data.
+
+    Arguments:
+        longitude_extent (tuple of floats): Westward and Eastward extents of the segment
+        latitude_extent (tuple of floats): Southward and Northward extents of the segment
+        timerange (tuple of datetime strings): Start and end of the segment, each in format %Y-%m-%d %H:%M:%S
+        segment_range (str): name of the segment (without the ``.nc`` extension, e.g., ``east_unprocessed``)
+        download_path (str): Location of where the script is saved
+        dataset_id (str): The ID of the dataset to download
+        variables (list of str): The variables to download
+        modify_existing (bool): Whether to add to an existing script or start a new one
+        project (str or None): the NCI project the user belongs to. If none, pbs directives aren't added and plain bash script is written.
+    Returns:
+        file path
+    """
+
+    buffer = 0.75  # Pads download regions to ensure that interpolation onto desired domain doesn't fail.
+    # Default is 0.74 degrees; just under three times the Glorys cell width (3 x 0.25 = 0.75).
+
+    path = Path(download_path)
+
+    if modify_existing:
+        file = open(Path(path / "get_bgc_data.pbs"), "r")
+        lines = file.readlines()
+        file.close()
+
+    elif project != None:
+        # Add pbs directives
+        lines = [
+            "#!/bin/bash\n",
+            "#PBS -N get_bgc_data\n",
+            f"#PBS -P {project}\n",
+            "#PBS -q copyq\n",
+            "#PBS -l ncpus=1\n",
+            "#PBS -l mem=4GB\n",
+            "#PBS -l walltime=10:00:00\n",
+            "#PBS -l wd\n",
+            f"#PBS -l storage=scratch/{project}+gdata/{project}+gdata/vk83\n",
+            "#PBS -o get_bgc_data.log\n",
+            "module use /g/data/vk83/modules\n",
+            "module load copernicusmarine/2.4.1\n",
+        ]
+    else:
+        lines = ["#!/bin/bash\n"]
+
+    file = open(Path(path / "get_bgc_data.pbs"), "w")
+
+    variable_args = " ".join([f"--variable {var}" for var in variables])
+
+    lines.append(
+        f"""copernicusmarine subset --dataset-id {dataset_id} {variable_args} --start-datetime {str(timerange[0]).replace(" ","T")} --end-datetime {str(timerange[1]).replace(" ","T")} --minimum-longitude {longitude_extent[0] - buffer} --maximum-longitude {longitude_extent[1] + buffer} --minimum-latitude {latitude_extent[0] - buffer} --maximum-latitude {latitude_extent[1] + buffer} --minimum-depth 0 --maximum-depth 6000 -o {str(path)} -f {segment_name}.nc\n
+""")
+    file.writelines(lines)
+    file.close()
+    return Path(path / "get_bgc_data.pbs")
 
 def add_version_to_ds(ds):
     """
@@ -1373,6 +1440,140 @@ class experiment:
             "3. Depending on the dataset size, the download process may take significant time and resources.\n"
         )
         return
+
+    def get_bgc(self, raw_boundaries_path, project=None):
+            """
+            This is a wrapper that calls :func:`~get_bgc_data` once for each of the rectangular boundary segments
+            and the initial condition. For more complex boundary shapes, call :func:`~get_bgc_data` directly for
+            each of your boundaries that aren't parallel to lines of constant latitude or longitude. For example,
+            for an angled Northern boundary that spans multiple latitudes, we need to download a wider rectangle
+            containing the entire boundary.
+    
+            Arguments:
+                raw_boundaries_path (str): Path to the directory containing the raw boundary forcing files.
+                boundaries (List[str]): List of cardinal directions for which to create boundary forcing files.
+                    Default is ``["south", "north", "west", "east"]``.
+                project (str or None): NCI project of the user, or None to set up a machine agnostic file instead
+            """
+
+            if self.bgc_model is None:
+                return
+
+            # Define where we take the biogeochemical data from.
+            self.bgc_dataset_id = "cmems_mod_glo_bgc_my_0.25deg_P1M-m"  # This is the Copernicus Marine dataset ID for the BGC model
+            
+            if self.bgc_model == "WOMBAT-lite":
+                self.bgc_variables = ['chl', 'phyc', 'o2', 'no3', 'fe']
+            elif self.bgc_model == "WOMBAT-mid":
+                self.bgc_variables = ['chl', 'phyc', 'o2', 'no3', 'fe', 'si']
+            elif self.bgc_model == "WOMBAT-full":
+                self.bgc_variables = ['chl', 'phyc', 'o2', 'no3', 'fe', 'si']
+            else:
+                raise ValueError(f"Unsupported BGC model: {self.bgc_model}")
+    
+            # Initial Condition
+            get_bgc_data(
+                longitude_extent=[float(self.hgrid.x.min()), float(self.hgrid.x.max())],
+                latitude_extent=[float(self.hgrid.y.min()), float(self.hgrid.y.max())],
+                timerange=[
+                    self.date_range[0] - dt.timedelta(days=32),
+                    self.date_range[0] + dt.timedelta(days=32),
+                ],
+                segment_name="ic_bgc_unprocessed",
+                download_path=raw_boundaries_path,
+                dataset_id=self.bgc_dataset_id,
+                variables=self.bgc_variables,
+                modify_existing=False,  # This is the first line, so start bash script anew
+                project=project,
+            )
+            if "east" in self.boundaries:
+                get_bgc_data(
+                    longitude_extent=[
+                        float(self.hgrid.x.isel(nxp=-1).min()),
+                        float(self.hgrid.x.isel(nxp=-1).max()),
+                    ],  ## Collect from Eastern (x = -1) side
+                    latitude_extent=[
+                        float(self.hgrid.y.isel(nxp=-1).min()),
+                        float(self.hgrid.y.isel(nxp=-1).max()),
+                    ],
+                    timerange=[
+                        self.date_range[0] - dt.timedelta(days=32),
+                        self.date_range[0] + dt.timedelta(days=32),
+                    ],
+                    segment_name="east_bgc_unprocessed",
+                    download_path=raw_boundaries_path,
+                    dataset_id=self.bgc_dataset_id,
+                    variables=self.bgc_variables,
+                )
+            if "west" in self.boundaries:
+                get_bgc_data(
+                    longitude_extent=[
+                        float(self.hgrid.x.isel(nxp=0).min()),
+                        float(self.hgrid.x.isel(nxp=0).max()),
+                    ],  ## Collect from Western (x = 0) side
+                    latitude_extent=[
+                        float(self.hgrid.y.isel(nxp=0).min()),
+                        float(self.hgrid.y.isel(nxp=0).max()),
+                    ],
+                    timerange=[
+                        self.date_range[0] - dt.timedelta(days=32),
+                        self.date_range[0] + dt.timedelta(days=32),
+                    ],
+                    segment_name="west_bgc_unprocessed",
+                    download_path=raw_boundaries_path,
+                    dataset_id=self.bgc_dataset_id,
+                    variables=self.bgc_variables,
+                )
+            if "south" in self.boundaries:
+                get_bgc_data(
+                    longitude_extent=[
+                        float(self.hgrid.x.isel(nyp=0).min()),
+                        float(self.hgrid.x.isel(nyp=0).max()),
+                    ],  ## Collect from Southern (y = 0) side
+                    latitude_extent=[
+                        float(self.hgrid.y.isel(nyp=0).min()),
+                        float(self.hgrid.y.isel(nyp=0).max()),
+                    ],
+                    timerange=[
+                        self.date_range[0] - dt.timedelta(days=32),
+                        self.date_range[0] + dt.timedelta(days=32),
+                    ],
+                    segment_name="south_bgc_unprocessed",
+                    download_path=raw_boundaries_path,
+                    dataset_id=self.bgc_dataset_id,
+                    variables=self.bgc_variables,
+                )
+            if "north" in self.boundaries:
+                get_bgc_data(
+                    longitude_extent=[
+                        float(self.hgrid.x.isel(nyp=-1).min()),
+                        float(self.hgrid.x.isel(nyp=-1).max()),
+                    ],  ## Collect from Southern (y = -1) side
+                    latitude_extent=[
+                        float(self.hgrid.y.isel(nyp=-1).min()),
+                        float(self.hgrid.y.isel(nyp=-1).max()),
+                    ],
+                    timerange=[
+                        self.date_range[0] - dt.timedelta(days=32),
+                        self.date_range[0] + dt.timedelta(days=32),
+                    ],
+                    segment_name="north_bgc_unprocessed",
+                    download_path=raw_boundaries_path,
+                    dataset_id=self.bgc_dataset_id,
+                    variables=self.bgc_variables,
+                )
+    
+            print(
+                f"The script `get_bgc_data.pbs` has been generated at:\n  {raw_boundaries_path}.\n"
+                "To download the data, qsub \n\n"
+                "Important instructions:\n"
+                "1. You will need your Copernicus Marine username and password.\n"
+                "   If you do not have an account, you can create one here: \n"
+                "   https://data.marine.copernicus.eu/register\n"
+                "2. Follow the instructions below to set up your account properly on gadi using `coperinucmarine login`. You may want to do this first on a login node before trying the pbs job. https://help.marine.copernicus.eu/en/articles/8185007-copernicus-marine-toolbox-credentials-configuration \n"
+                "3. Depending on the dataset size, the download process may take significant time and resources.\n"
+            )
+            return
 
     def setup_ocean_state_boundaries(
         self,
