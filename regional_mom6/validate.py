@@ -154,3 +154,11 @@ def validate_general_file(
 
         # Check the correct number of dimensions
         _check_required_dimensions(ds[var], surface=(var == surface_var))
+
+def validate_bgc_model(bgc_model):
+    """Validate that the bgc_model input is one of supported types"""
+    supported = ("WOMBAT-lite", "WOMBAT-mid", "WOMBAT-full")
+    if bgc_model is not None and bgc_model not in supported:
+        raise ValueError(
+            f"Unsupported bgc_model: {bgc_model}. Please choose from {supported} or None"
+        )

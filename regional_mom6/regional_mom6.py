@@ -37,7 +37,7 @@ from mom6_forge.utils import longitude_slicer
 from mom6_forge.vgrid import *
 from mom6_forge.grid import *
 from mom6_forge.topo import *
-from regional_mom6.validate import validate_obc_file, validate_general_file
+from regional_mom6.validate import validate_obc_file, validate_general_file, validate_bgc_model
 
 warnings.filterwarnings("ignore")
 
@@ -229,6 +229,7 @@ def add_version_to_ds(ds):
     return ds
 
 
+
 class experiment:
     """The main class for setting up a regional experiment.
 
@@ -285,6 +286,8 @@ class experiment:
         boundaries (List[str]): List of (rectangular) boundaries to be set. Default is ``["south", "north", "west", "east"]``. The boundaries are set as (list index + 1) in MOM_override in the order of the list, and less than 4 boundaries can be set.
         regridding_method (str): regridding method to use throughout the entire experiment. Default is ``'bilinear'``. Any other xesmf regridding method can be used.
         fill_method (Function): The fill function to be used after regridding datasets. it takes a xarray DataArray and returns a filled DataArray. Default is ``rgd.fill_missing_data``.
+        bgc_model (str, optional): The biogeochemical model to be used in the experiment. Default is ``None``. Options include ``'WOMBAT-lite'``, 
+            ``'WOMBAT-mid'`` and ``'WOMBAT-full'``. If set, the experiment will set up the biogeochemical boundary forcing, configuration files and initial conditions.
     """
 
     @classmethod
@@ -308,6 +311,7 @@ class experiment:
         boundaries=["south", "north", "west", "east"],
         regridding_method="bilinear",
         fill_method=rgd.fill_missing_data,
+        bgc_model=None,
     ):
         """
         **Note**: This method is unsafe; *only* experience users are urged to use it!
@@ -319,6 +323,10 @@ class experiment:
         like just regridding the initial condition or subsetting bathymetry, instead of having to set so many other variables
         that aren't needed.
         """
+
+        # Ensure that the bgc_model selected is supported
+        validate_bgc_model(bgc_model)
+
         expt = cls(
             longitude_extent=None,
             latitude_extent=None,
@@ -338,6 +346,7 @@ class experiment:
             expt_name=None,
             regridding_method=None,
             fill_method=None,
+            bgc_model=None,
         )
 
         expt.expt_name = expt_name
@@ -360,6 +369,7 @@ class experiment:
         expt.boundaries = boundaries
         expt.regridding_method = regridding_method
         expt.fill_method = fill_method
+        expt.bgc_model = bgc_model
         expt.m6f_hgrid = None
         expt.m6f_vgrid = None
         expt.m6f_bathymetry = None
@@ -391,6 +401,7 @@ class experiment:
         boundaries=["south", "north", "west", "east"],
         regridding_method="bilinear",
         fill_method=rgd.fill_missing_data,
+        bgc_model=None,
     ):
         # Creates an empty experiment object for testing and experienced user manipulation.
         if create_empty:
@@ -424,6 +435,7 @@ class experiment:
         self.tidal_constituents = tidal_constituents
         self.regridding_method = regridding_method
         self.fill_method = fill_method
+        validate_bgc_model(bgc_model); self.bgc_model = bgc_model
         # `self.m6f_hgrid`/`self.m6f_vgrid`/`self.m6f_bathymetry` are the mom6_forge
         # class objects backing the `hgrid`/`vgrid`/`bathymetry` properties (see below).
         # When one isn't supplied directly, the properties lazily read it from
