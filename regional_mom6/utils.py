@@ -57,9 +57,24 @@ def try_pint_convert(da, target_units, var_name=None, debug=False):
         if not source_units:
             raise ValueError(f"DataArray '{var_name}' has no units; cannot quantify.")
 
+        # Normalize source unit strings into Pint syntax.
+        unit_aliases = {
+            "degrees_C": "degC",
+            "mmol m-3": "mmol / m**3",
+            "mol m-3": "mol / m**3",
+            "umol m-3": "umol / m**3",
+            "mg m-3": "mg / m**3",
+        }
+        da = da.copy()
+        source_units = source_units.strip()
+        source_units = unit_aliases.get(source_units, source_units)
+        da.attrs["units"] = source_units
+
         # Only quantify if not already a Pint Quantity
         if not isinstance(da.data, pint.Quantity):
             da_quantified = da.pint.quantify(unit_registry=ureg)
+        else:
+            da_quantified = da  # Already quantified
 
             # code for PintExceptionGroup (not supported in current CI until we can use pint 0.6.0)
             # Allows catching multiple quantification errors at once

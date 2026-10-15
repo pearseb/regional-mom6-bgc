@@ -1023,13 +1023,13 @@ class experiment:
         )
 
         # Convert values
-        for var in rgd.main_field_target_units:
+        for var in ("eta", "u", "v", "temp"):
             if var == "temp" or var == "salt":
                 value_name = reprocessed_var_map["tracer_var_names"][var]
             else:
                 value_name = reprocessed_var_map[var + "_var_name"]
             ic_raw[value_name] = try_pint_convert(
-                ic_raw[value_name], rgd.main_field_target_units[var], var
+                ic_raw[value_name], rgd.main_field_target_units[var], var, debug=True
             )
         # Remove time dimension if present in the IC.
         # Assume that the first time dim is the intended one if more than one is present
@@ -1343,6 +1343,194 @@ class experiment:
             },
         )
         return
+
+    def setup_initial_bgc_condition(
+            self,
+            raw_ic_path,
+            varnames,
+            vcoord_type="height",
+            regridding_method=None,
+        ):
+            """
+            Reads the initial BGC condition from files in ``raw_ic_path``, interpolates to the
+            model grid, fixes up metadata, and saves back to the input directory.
+    
+            Arguments:
+                raw_ic_path (Union[str, Path]): Path to raw initial condition file to read in.
+                varnames (Dict[str, str]): Mapping from MOM6 variable/coordinate names to the names
+                    in the input dataset. For example, ``{'xq': 'lonq', 'yh': 'lath', 'chl': 'pchl', ...}``.
+                vcoord_type (Optional[str]): The type of vertical coordinate used in the forcing files.
+                    Either ``'height'`` or ``'thickness'``.
+                regridding_method (Optional[str]): The type of regridding method to use. Defaults to self.regridding_method
+            """
+            if regridding_method is None:
+                regridding_method = self.regridding_method
+    
+            reprocessed_var_map = {
+                "tracer_x_coord": varnames["xh"],
+                "tracer_y_coord": varnames["yh"],
+                "tracer_lon_coord": varnames["xh"],
+                "tracer_lat_coord": varnames["yh"],
+                "depth_coord": varnames["zl"],
+                "time_var_name": varnames["time"],
+                "tracer_var_names": varnames["tracers"],
+            }
+    
+            if not Path(raw_ic_path).exists():
+                raise FileNotFoundError(
+                    f"Initial BGC condition file not found at {raw_ic_path}. Please ensure that the files are named in the format `ic_bgc_unprocessed.nc`."
+                )
+            ic_raw = xr.open_dataset(raw_ic_path)
+    
+            # There is a case where MARBL tracers have multiple zdims, this is not supported for initial conditions:
+            if type(reprocessed_var_map["depth_coord"]) == list:
+                reprocessed_var_map["depth_coord"] = reprocessed_var_map["depth_coord"][0]
+    
+            # Convert zdim if possible & needed
+            ic_raw[reprocessed_var_map["depth_coord"]] = try_pint_convert(
+                ic_raw[reprocessed_var_map["depth_coord"]],
+                "m",
+                reprocessed_var_map["depth_coord"],
+            )
+
+            # Convert mg/m³ to mmol/m³ using 12 g/mol assuming carbon is the element
+            ic_raw["chl"] = ic_raw["chl"] / 12.0
+            ic_raw["chl"].attrs["units"] = "mmol/m**3"
+                
+            # Convert BGC values
+            for var,value_name in reprocessed_var_map["tracer_var_names"].items():
+                ic_raw[value_name] = try_pint_convert(
+                    ic_raw[value_name], rgd.main_field_target_units[var], var, debug=True
+                )
+            # Remove time dimension if present in the IC.
+            # Assume that the first time dim is the intended one if more than one is present
+    
+            if reprocessed_var_map["time_var_name"] in ic_raw.dims:
+                ic_raw = ic_raw.isel({reprocessed_var_map["time_var_name"]: 0})
+            if reprocessed_var_map["time_var_name"] in ic_raw.coords:
+                ic_raw = ic_raw.drop(reprocessed_var_map["time_var_name"])
+    
+            # Separate out tracers from two velocity fields of IC
+            try:
+                ic_raw_tracers = ic_raw[
+                    [
+                        reprocessed_var_map["tracer_var_names"][i]
+                        for i in reprocessed_var_map["tracer_var_names"]
+                    ]
+                ]
+            except:
+                raise ValueError(
+                    "Error in reading in initial condition tracers. Terminating!"
+                )
+    
+            # NaNs might be here from the land mask of the model that the IC has come from.
+            # If they're not removed then the coastlines from this other grid will be retained!
+            # The land mask comes from the bathymetry file, so we don't need NaNs
+            # to tell MOM6 where the land is.
+            ic_raw_tracers = (
+                ic_raw_tracers.interpolate_na(
+                    reprocessed_var_map["tracer_x_coord"], method="linear"
+                )
+                .ffill(reprocessed_var_map["tracer_x_coord"])
+                .bfill(reprocessed_var_map["tracer_x_coord"])
+                .ffill(reprocessed_var_map["tracer_y_coord"])
+                .bfill(reprocessed_var_map["tracer_y_coord"])
+                .ffill(reprocessed_var_map["depth_coord"])
+            )
+    
+            # If the input data is on a curvilinear grid, the lat/lon values are a different dimension name then the variable dims (think velocity(depth, time, x,y) and lat(x,y))
+            # So use lon/lat coord is specified for u, v, & tracers which is different than an x or y coord in each regridding (because regridding needs the lat/lon)
+            ic_raw_tracers = ic_raw_tracers.rename(
+                {
+                    reprocessed_var_map["tracer_lat_coord"]: "lat",
+                    reprocessed_var_map["tracer_lon_coord"]: "lon",
+                }
+            )
+    
+            hgrid = self.hgrid
+            hgrid["lon"] = hgrid["x"]
+            hgrid["lat"] = hgrid["y"]
+            tgrid = (
+                rgd.get_hgrid_arakawa_c_points(hgrid, "t")
+                .rename({"tlon": "lon", "tlat": "lat", "nxp": "nx", "nyp": "ny"})
+                .set_coords(["lat", "lon"])
+            )
+    
+            ## Make our three horizontal regridders
+            regridder_t = rgd.create_regridder(
+                ic_raw_tracers, tgrid, locstream_out=False, method=regridding_method
+            )
+    
+            ## Construct the cell centre grid for tracers (xh, yh).
+            print("Setting up Initial Conditions")
+            print("Regridding BGC Tracers... ", end="")
+            tracers_out = (
+                xr.merge(
+                    [
+                        regridder_t(
+                            ic_raw_tracers[reprocessed_var_map["tracer_var_names"][i]]
+                        ).rename(i)
+                        for i in reprocessed_var_map["tracer_var_names"]
+                    ]
+                )
+                .rename(
+                    {"lon": "xh", "lat": "yh", reprocessed_var_map["depth_coord"]: "zl"}
+                )
+                .transpose("zl", "ny", "nx", ...)
+            )
+            # tracers_out = tracers_out.assign_coords(
+            #     {"nx":np.arange(tracers_out.sizes["nx"]).astype(float),
+            #      "ny":np.arange(tracers_out.sizes["ny"]).astype(float)})
+            # Add dummy values for the nx and ny dimensions. Otherwise MOM6 complains that it's missing data??
+            tracers_out = tracers_out.assign_coords(
+                {
+                    "nx": np.arange(tracers_out.sizes["nx"]).astype(float),
+                    "ny": np.arange(tracers_out.sizes["ny"]).astype(float),
+                }
+            )
+    
+            print("Done.", end="")
+    
+            tracers_out.xh.attrs = ic_raw_tracers.lon.attrs
+            tracers_out.yh.attrs = ic_raw_tracers.lat.attrs
+            tracers_out.zl.attrs = ic_raw_tracers[reprocessed_var_map["depth_coord"]].attrs
+            for i in reprocessed_var_map["tracer_var_names"]:
+                tracers_out[i].attrs = ic_raw_tracers[
+                    reprocessed_var_map["tracer_var_names"][i]
+                ].attrs
+    
+            ## Regrid the fields vertically
+            if (
+                vcoord_type == "thickness"
+            ):  ## In this case construct the vertical profile by summing thickness
+                tracers_out["zl"] = tracers_out["zl"].diff("zl")
+                dz = rgd.generate_dz(tracers_out, self.z)
+    
+            # The extrapolate arg allows the initial condition to fill beyond the range of the input data.
+            tracers_out = tracers_out.interp(
+                {"zl": self.vgrid.zl.values}, kwargs={"fill_value": "extrapolate"}
+            )
+            
+            print("Saving outputs... ", end="")
+            
+            encoding = {
+                var: {"_FillValue": -1e20, "missing_value": -1e20}
+                for var in reprocessed_var_map["tracer_var_names"].keys()
+            }
+            add_version_to_ds(rgd.fill_missing_data(tracers_out, "all")).to_netcdf(
+                self.mom_input_dir / "init_bgc_tracers.nc",
+                mode="w",
+                encoding=encoding,
+            )
+            
+            self.ic_bgc_tracers = tracers_out
+            
+            validate_general_file(
+                tracers_out,
+                list(reprocessed_var_map["tracer_var_names"].keys()),
+                encoding,
+            )
+            return        
 
     def get_glorys(self, raw_boundaries_path, project=None):
         """
