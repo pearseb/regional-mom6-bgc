@@ -10,6 +10,7 @@ import datetime as dt
 import warnings
 import shutil
 import os
+import cftime
 import importlib.resources
 from importlib.metadata import version
 import urllib.request
@@ -1820,18 +1821,13 @@ class experiment:
 
         # In the future, we should change varnames to physical_varnames
         physical_varnames = varnames
-        all_varnames = physical_varnames.copy()
-
-        # Merge the bgc tracer names into the varnames
-        if bgc_tracer_names:
-            key = "tracers" if "tracers" in physical_varnames else "tracer_var_names"
-            all_varnames[key] = {**physical_varnames[key], **bgc_tracer_names}
-
+        phy_varnames = physical_varnames.copy()
+        
         # Now iterate through our four boundaries
         for orientation in self.boundaries:
             self.setup_single_boundary(
                 Path(raw_boundaries_path / (orientation + "_unprocessed.nc")),
-                all_varnames,
+                phy_varnames,
                 orientation,  # The cardinal direction of the boundary
                 self.find_MOM6_rectangular_orientation(
                     orientation
@@ -1842,6 +1838,26 @@ class experiment:
                 fill_method=fill_method,
             )
 
+        # Now iterate through our four boundaries
+        if bgc_tracer_names:
+            bgc_varnames = physical_varnames.copy()
+            key = "tracers" if "tracers" in physical_varnames else "tracer_var_names"
+            bgc_varnames[key] = bgc_tracer_names.copy()
+
+            for orientation in self.boundaries:
+                self.setup_single_bgc_boundary(
+                    Path(raw_boundaries_path / (orientation + "_bgc_unprocessed.nc")),
+                    bgc_varnames,
+                    orientation,  # The cardinal direction of the boundary
+                    self.find_MOM6_rectangular_orientation(
+                        orientation
+                    ),  # A number to identify the boundary; indexes from 1
+                    arakawa_grid=arakawa_grid,
+                    bathymetry_path=bathymetry_path,
+                    regridding_method=regridding_method,
+                    fill_method=fill_method,
+                )
+        
         # Scrape the bgc var names into their own files for the boundary conditions (required for generic tracers at the moment, Apr 2026)
         self.reformat_bgc_tracers_into_files(bgc_tracer_names)
 
@@ -1862,7 +1878,7 @@ class experiment:
         for boundary in self.boundaries:
             num = str(self.find_MOM6_rectangular_orientation(boundary)).zfill(3)
             datasets[num] = xr.open_dataset(
-                self.mom_input_dir / f"forcing_obc_segment_{num}.nc"
+                self.mom_input_dir / f"forcing_obc_bgc_segment_{num}.nc"
             )
 
         # Get base variable names
@@ -1937,6 +1953,66 @@ class experiment:
             repeat_year_forcing=self.repeat_year_forcing,
         )
 
+        print("Done.")
+        return
+
+    def setup_single_bgc_boundary(
+        self,
+        path_to_bc,
+        varnames,
+        orientation,
+        segment_number,
+        arakawa_grid="A",
+        bathymetry_path=None,
+        regridding_method=None,
+        fill_method=None,
+    ):
+        """
+        Set up a boundary forcing file for a given ``orientation``.
+
+        Arguments:
+            path_to_bc (str): Path to boundary forcing file. Ideally this should be a pre cut-out
+                netCDF file containing only the boundary region and 3 extra boundary points on either
+                side. Users can also provide a large dataset containing their entire domain but this
+                will be slower.
+            varnames (Dict[str, str]): Mapping from MOM6 variable/coordinate names to the name in the
+                input dataset.
+            orientation (str): Orientation of boundary forcing file, i.e., ``'east'``, ``'west'``,
+                ``'north'``, or ``'south'``.
+            segment_number (int): Number the segments according to how they'll be specified in
+                the ``MOM_input``.
+            arakawa_grid (Optional[str]): Arakawa grid staggering type of the boundary forcing.
+                Either ``'A'`` (default), ``'B'``, or ``'C'``.
+            bathymetry_path (str): Path to the bathymetry file. Default is ``None``, in which case
+                the boundary condition is not masked.
+            regridding_method (Optional[str]): The type of regridding method to use. Defaults to self.regridding_method
+            fill_method (Function): Fill method to use throughout the function. Default is ``rgd.fill_missing_data``
+        """
+        if regridding_method is None:
+            regridding_method = self.regridding_method
+        if fill_method is None:
+            fill_method = self.fill_method
+    
+        print(
+            "Processing {} boundary biogeochemical tracers...".format(orientation), end=""
+        )
+        if not Path(path_to_bc).exists():
+            raise FileNotFoundError(
+                f"Boundary file not found at {path_to_bc}. Please ensure that the files are named in the format `east_bgc_unprocessed.nc`."
+            )
+        segment = self._get_segment(orientation, bathymetry_path=bathymetry_path)
+    
+        segment.regrid_bgc_tracers(
+            infile=path_to_bc,  # location of raw boundary
+            varnames=varnames,
+            outfolder=self.mom_input_dir,
+            startdate=self.date_range[0],
+            arakawa_grid=arakawa_grid,
+            regridding_method=regridding_method,
+            fill_method=fill_method,
+            repeat_year_forcing=self.repeat_year_forcing,
+        )
+        
         print("Done.")
         return
 

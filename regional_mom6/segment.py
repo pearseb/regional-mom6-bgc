@@ -78,6 +78,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xarray as xr
+import cftime
 
 from mom6_forge.grid import Grid
 
@@ -999,6 +1000,291 @@ class Segment:
             output_var_list,
             encoding_dict,
             surface_var=f"eta_{self.segment_name}",
+        )
+
+        return segment_out, encoding_dict
+
+    def regrid_bgc_tracers(
+        self,
+        infile,
+        varnames: dict,
+        outfolder,
+        startdate,
+        arakawa_grid="A",
+        regridding_method="bilinear",
+        time_units="days",
+        calendar="gregorian",
+        fill_method=rgd.fill_missing_data,
+        regridders=None,
+        repeat_year_forcing=False,
+        ignore_degenerate=False,
+    ):
+        """
+        Cut out and interpolate the biogeochemical tracers onto this segment.
+
+        Arguments:
+            infile (Union[str, Path]): Path to the raw, unprocessed segment forcing file.
+            varnames (Dict[str, str]): Mapping between the variable/dimension names and
+                standard naming convention of this pipeline, e.g., ``{"xh": "longitude",
+                "yh": "latitude", "o2": "oxygen", ...}``. Key "tracers" points to a
+                nested dictionary of tracers to include in the segment.
+            outfolder (Union[str, Path]): Path to folder where the model inputs will
+                be stored.
+            startdate (str): The starting date to use in the segment calendar.
+            arakawa_grid (Optional[str]): Arakawa grid staggering type of the segment
+                forcing. Either ``'A'`` (default), ``'B'``, or ``'C'``.
+            regridding_method (str): Regridding method to use throughout the function.
+                Default is ``'bilinear'``.
+            time_units (str): The units used by the raw forcing files. Default ``'days'``.
+            calendar (str): Calendar to use for the time coordinate. Default ``'gregorian'``.
+            fill_method (Function): Fill method to use throughout the function. Default
+                is ``rgd.fill_missing_data``.
+            regridders (dict, optional): Pre-built regridders with keys ``"tracers"``.
+                If provided, regridder creation is skipped entirely --
+                useful when calling this method multiple times for different time
+                windows on the same segment (pass ``segment._bgc_regridders`` from a
+                prior call). Default ``None`` -- regridders are built and cached on
+                ``self._bgc_regridders`` for reuse on the next call.
+            repeat_year_forcing (Optional[bool]): When ``True`` the experiment runs
+                with repeat-year forcing. When ``False`` (default) inter-annual
+                forcing is used.
+            ignore_degenerate (bool): Passed through to regridder construction --
+                skip degenerate source cells instead of raising. Default ``False``.
+                Needed for source datasets with duplicate/collapsed cells near the
+                poles; see ``rgd.create_regridder``. Ignored when ``regridders`` is
+                supplied, since no regridder is built.
+        """
+        if arakawa_grid is None:
+            # Already-expanded coordinate mapping.
+            reprocessed_var_map = varnames.copy()
+        elif arakawa_grid in ("A", "B", "C"):
+            # Only tracer coordinates matter here.
+            reprocessed_var_map = {
+                "tracer_x_coord": varnames["xh"],
+                "tracer_y_coord": varnames["yh"],
+                "tracer_lon_coord": varnames["xh"],
+                "tracer_lat_coord": varnames["yh"],
+                "depth_coord": varnames["zl"],
+                "time_var_name": varnames["time"],
+                "tracer_var_names": varnames["tracers"],
+            }
+        else:
+            raise ValueError("arakawa_grid must be 'A', 'B', 'C', or None")
+
+        if not reprocessed_var_map["tracer_var_names"]:
+            raise ValueError("At least one BGC tracer must be specified.")
+        
+        outfolder = Path(outfolder)
+        (outfolder / "weights").mkdir(exist_ok=True)
+
+        # open the raw BGC data
+        rawseg = xr.open_mfdataset(infile, decode_times=False, engine="netcdf4")
+
+        # Convert z coordinates to meters if pint-enabled
+        if type(reprocessed_var_map["depth_coord"]) != list:
+            dc_list = [reprocessed_var_map["depth_coord"]]
+        else:
+            dc_list = reprocessed_var_map["depth_coord"]
+        for dc in dc_list:
+            rawseg[dc] = try_pint_convert(rawseg[dc], "m", dc)
+
+        if regridders is None:
+            # Use the first BGC tracer to identify the source horizontal grid.
+            first_tracer = next(
+                iter(reprocessed_var_map["tracer_var_names"].values())
+            )
+
+            regridders = {
+                "tracers": rgd.create_regridder(
+                    rawseg[first_tracer].rename(
+                        {
+                            reprocessed_var_map["tracer_lon_coord"]: "lon",
+                            reprocessed_var_map["tracer_lat_coord"]: "lat",
+                        }
+                    ),
+                    self._coords_ds,
+                    outfolder / (
+                        f"weights/{regridding_method}_bgc_tracer_weights_"
+                        f"{self.segment_name}.nc"
+                    ),
+                    method=regridding_method,
+                    ignore_degenerate=ignore_degenerate,
+                )
+            }
+
+        # Keep BGC weights separate from the physical regridder cache.
+        self._bgc_regridders = regridders
+
+        segment_out = regridders["tracers"](
+            rawseg[
+                list(reprocessed_var_map["tracer_var_names"].values())
+            ].rename(
+                {
+                    reprocessed_var_map["tracer_lon_coord"]: "lon",
+                    reprocessed_var_map["tracer_lat_coord"]: "lat",
+                }
+            )
+        )
+
+        ## segment_out now contains our interpolated segment.
+        ## Now, we need to fix up all the metadata and save
+        segment_out = segment_out.rename(
+            {"lon": f"lon_{self.segment_name}", "lat": f"lat_{self.segment_name}"}
+        )
+
+        # Clean up the time coordinate, which may be in days or months since some arbitrary date.
+        # Standardise the time-coordinate name to days since startdate.
+        time_name = reprocessed_var_map["time_var_name"]
+        if time_name != "time":
+            segment_out = segment_out.rename({time_name: "time"})
+        # Read the original time metadata (opened with decode_times=False).
+        source_time = rawseg[reprocessed_var_map["time_var_name"]]
+        source_units = source_time.attrs.get("units")
+        source_calendar = source_time.attrs.get("calendar", "standard")
+        if source_units is None:
+            raise ValueError(
+                f"Source time coordinate has no units. Attributes: {source_time.attrs}"
+            )
+        # Preserve the source calendar.
+        calendar = source_calendar
+        output_time_units = f"days since {startdate}"
+        # Decode the original timestamps, then express them relative to startdate.
+        source_dates = cftime.num2date(
+            source_time.values,
+            units=source_units,
+            calendar=source_calendar,
+        )
+        source_days = np.asarray(
+            cftime.date2num(
+                source_dates,
+                units=output_time_units,
+                calendar=calendar,
+            ),
+            dtype=float,
+        )
+        segment_out = segment_out.assign_coords(time=source_days).sortby("time")
+        # Check for sufficient source timesteps before interpolation
+        if segment_out.sizes["time"] < 2:
+            raise ValueError("Daily interpolation requires at least two source times.")
+        if np.any(np.diff(segment_out.time.values) <= 0):
+            raise ValueError("Source timestamps must be unique.")
+        # Daily timestamps within the range covered by the source data.
+        daily_days = np.arange(
+            np.ceil(segment_out.time.values[0]),
+            np.floor(segment_out.time.values[-1]) + 1,
+            dtype=float,
+        )
+        # Interpolate every time-dependent tracer onto the daily time axis and correct attributes.
+        segment_out = segment_out.interp(time=daily_days, method="linear")
+        segment_out.time.attrs = {
+            "calendar": calendar,
+            "units": output_time_units,
+            "axis": "T",
+        }
+
+        # Here, keep in mind that 'var' keeps track of the mom6 variable names we want, and self.tracers[var]
+        # will return the name of the variable from the original data
+        output_var_list = []
+        allfields = reprocessed_var_map["tracer_var_names"]
+        
+        for (
+            var
+        ) in (
+            allfields
+        ):  ## Replace with more generic list of tracer variables that might be included?
+            v = f"{var}_{self.segment_name}"
+            ## Rename each variable in dataset
+            segment_out = segment_out.rename({allfields[var]: v})
+            output_var_list.append(v)
+
+            # Try Pint Conversion
+            if var in rgd.main_field_target_units:
+                # Apply raw data units if they exist
+                units = rawseg[allfields[var]].attrs.get("units")
+                if units is not None:
+                    segment_out[v].attrs["units"] = units
+
+                segment_out[v] = try_pint_convert(
+                    segment_out[v], rgd.main_field_target_units[var], var
+                )
+
+            # Find out if the tracer has depth, and if so, what is it's z dimension (z dimension being a list is an edge case for MARBL BGC)
+            variable_has_depth = False
+            depth_coord = None
+            if type(reprocessed_var_map["depth_coord"]) != list:
+                dc_list = [reprocessed_var_map["depth_coord"]]
+            else:
+                dc_list = reprocessed_var_map["depth_coord"]
+
+            for dc in dc_list:
+                if dc in segment_out[v].dims:
+                    depth_coord = dc
+                    variable_has_depth = True
+                    break
+
+            if variable_has_depth:
+                segment_out = rgd.vertical_coordinate_encoding(
+                    segment_out,
+                    v,
+                    self.segment_name,
+                    depth_coord,
+                )
+
+            segment_out = rgd.add_secondary_dimension(
+                segment_out, v, self, self.segment_name
+            )
+            if variable_has_depth:
+                segment_out = rgd.generate_layer_thickness(
+                    segment_out,
+                    v,
+                    self.segment_name,
+                    depth_coord,
+                )
+
+        # fill in NaNs
+        segment_out = fill_method(
+            segment_out,
+            dim="all",
+        )
+
+        # Overwrite the actual lat/lon values in the dimensions, replace with incrementing integers
+        segment_out[f"{self.perpendicular}_{self.segment_name}"] = [0]
+
+        segment_out[f"{self.parallel}_{self.segment_name}"] = np.arange(
+            segment_out[f"{self.parallel}_{self.segment_name}"].size
+        )
+        segment_out[f"ny_{self.segment_name}"].attrs["axis"] = "Y"
+        segment_out[f"nx_{self.segment_name}"].attrs["axis"] = "X"
+        encoding_dict = {
+            "time": {"dtype": "double"},
+            f"nx_{self.segment_name}": {
+                "dtype": "int32",
+            },
+            f"ny_{self.segment_name}": {
+                "dtype": "int32",
+            },
+        }
+        segment_out = rgd.mask_dataset(segment_out, self)
+        encoding_dict = rgd.generate_encoding(
+            segment_out,
+            encoding_dict,
+            default_fill_value=1.0e20,
+        )
+        # If repeat-year forcing, add modulo coordinate
+        if repeat_year_forcing:
+            segment_out["time"] = segment_out["time"].assign_attrs({"modulo": " "})
+        
+        segment_out.load().to_netcdf(
+            outfolder / f"forcing_obc_bgc_{self.segment_name}.nc",
+            encoding=encoding_dict,
+            unlimited_dims="time",
+        )
+
+        validate_obc_file(
+            segment_out,
+            output_var_list,
+            encoding_dict,
+            surface_var=None,
         )
 
         return segment_out, encoding_dict
