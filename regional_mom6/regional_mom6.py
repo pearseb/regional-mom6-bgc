@@ -2016,6 +2016,165 @@ class experiment:
         print("Done.")
         return
 
+    def setup_derived_bgc_tracers(self, relationships):
+        """
+        Derive BGC initial conditions and boundaries from existing tracers.
+
+        E.g.,
+
+        relationships = {
+            "dic": {
+                "inputs": ["temp", "salt"],
+                "function": lambda fields: derive_dic(
+                    fields["temp"], fields["salt"]
+                    ),
+                "units": "mol/L",
+            },
+            "zoo": {
+                "inputs": ["phy"],
+                "function": lambda fields: 0.2 * fields["phy"],
+                "units": "mol/L",
+            }
+        }
+
+        expt.setup_derived_bgc_tracers(relationships)
+    
+        """
+
+        input_dir = Path(self.mom_input_dir)
+
+        # Read initial conditions into memory and close the files.
+        with xr.open_dataset(input_dir / "init_tracers.nc") as ds:
+            physical_ic = ds.load()
+
+        with xr.open_dataset(input_dir / "init_bgc_tracers.nc") as ds:
+            bgc_ic = ds.load()
+
+        for tracer, settings in relationships.items():
+            inputs = settings["inputs"]
+            relationship = settings["function"]
+
+            # ----------------------------------------------------------
+            # Initial conditions
+            # ----------------------------------------------------------
+            fields = {}
+
+            for name in inputs:
+                if name in ("temp", "salt"):
+                    fields[name] = physical_ic[name]
+                else:
+                    fields[name] = bgc_ic[name]
+
+            # Require matching coordinates before applying the relationship.
+            aligned = xr.align(*fields.values(), join="exact")
+            fields = dict(zip(inputs, aligned))
+
+            derived = relationship(fields)
+            xr.align(derived, bgc_ic, join="exact")
+
+            bgc_ic[tracer] = derived
+            bgc_ic[tracer].attrs = {"units": settings["units"]}
+
+            # ----------------------------------------------------------
+            # Boundary conditions
+            # ----------------------------------------------------------
+            segments = []
+
+            for boundary in self.boundaries:
+                number = self.find_MOM6_rectangular_orientation(boundary)
+                segment = f"segment_{number:03d}"
+
+                fields = {}
+                thicknesses = {}
+
+                for name in inputs:
+                    if name in ("temp", "salt"):
+                        filename = f"forcing_obc_{segment}.nc"
+                    else:
+                        filename = f"{name}_obc_segment.nc"
+
+                    with xr.open_dataset(input_dir / filename) as ds:
+                        source = ds.load()
+
+                    variable = f"{name}_{segment}"
+                    field = source[variable]
+                    thickness = source[f"dz_{variable}"]
+
+                    # Give all inputs the same vertical dimension name.
+                    field_z = next(
+                        dim for dim in field.dims if dim.startswith("nz_")
+                    )
+                    thickness_z = next(
+                        dim for dim in thickness.dims if dim.startswith("nz_")
+                    )
+
+                    fields[name] = field.rename({field_z: "z"})
+                    thicknesses[name] = thickness.rename({thickness_z: "z"})
+
+                    # Keep the first input's geographic coordinates.
+                    if name == inputs[0]:
+                        geography = source[
+                            [f"lon_{segment}", f"lat_{segment}"]
+                        ].copy()
+
+                aligned = xr.align(*fields.values(), join="exact")
+                fields = dict(zip(inputs, aligned))
+
+                # Layer indices can match even when actual depths differ.
+                template_dz = thicknesses[inputs[0]]
+
+                for name in inputs[1:]:
+                    reference, other = xr.align(
+                        template_dz, thicknesses[name], join="exact"
+                    )
+                    other = other.transpose(*reference.dims)
+
+                    if not np.allclose(
+                        reference.values, other.values, equal_nan=True
+                    ):
+                        raise ValueError(
+                            f"{tracer}: inputs have different depths on {segment}"
+                        )
+
+                derived = relationship(fields)
+                derived = derived.transpose(*fields[inputs[0]].dims)
+
+                variable = f"{tracer}_{segment}"
+                depth = f"nz_{segment}_{tracer}"
+
+                output = geography
+                output[variable] = derived.rename({"z": depth})
+                output[f"dz_{variable}"] = template_dz.rename({"z": depth})
+
+                output[variable].attrs = {
+                    "units": settings["units"],
+                    "coordinates": f"lon_{segment} lat_{segment}",
+                }
+
+                segments.append(output)
+
+            # One boundary file per tracer, containing all segments.
+            output = xr.merge(segments, join="exact")
+
+            encoding = rgd.generate_encoding(
+                output,
+                {"time": {"dtype": "double"}},
+                default_fill_value=1.0e20,
+            )
+
+            add_version_to_ds(output).to_netcdf(
+                input_dir / f"{tracer}_obc_segment.nc",
+                encoding=encoding,
+                unlimited_dims="time",
+            )
+
+        # Save the expanded BGC initial-condition dataset.
+        add_version_to_ds(bgc_ic).to_netcdf(
+            input_dir / "init_bgc_tracers.nc"
+        )
+
+        self.ic_bgc_tracers = bgc_ic
+
     def setup_boundary_tides(
         self,
         tpxo_elevation_filepath,
@@ -2284,13 +2443,15 @@ class experiment:
 
     def setup_generic(self, ncpus=100, mask_land_cpus=True):
         """
-        Set up the run directory for the model run. This is a multi step process - given that NUOPC vs FMS based runs are quite different, this function handles all of the setup steps that they share in common, with more specific steps performed in setup_rOM3 and setup_FMS_version respectively.
+        Set up the run directory for the model run. This is a multi step process - given that NUOPC vs FMS based runs are quite different, 
+        this function handles all of the setup steps that they share in common, with more specific steps performed in setup_rOM3 and setup_FMS_version respectively.
 
         The main thing this function does is manage the MOM_override file, as this is common to both use cases.
 
         Arguments:
             ncpus (Optional[int]): The number of PEs to use
-            mask_land_cpus (Optional[bool]): If your domain has enough land in it that some processors would only have land to deal with, set to True. If a mostly water domain, set to False otherwise the automatic mask table throws a fatal (see issue: https://github.com/issues/created?issue=mom-ocean%7CMOM6%7C1686)
+            mask_land_cpus (Optional[bool]): If your domain has enough land in it that some processors would only have land to deal with, set to True. 
+            If a mostly water domain, set to False otherwise the automatic mask table throws a fatal (see issue: https://github.com/issues/created?issue=mom-ocean%7CMOM6%7C1686)
         """
         # Check if we need tides
         with_tides = len(self.tidal_constituents) > 0
@@ -2489,6 +2650,7 @@ class experiment:
 
             try:
                 url = "https://github.com/ACCESS-NRI/access-om3-configs"
+                url = "https://github.com/pearseb/access-om3-configs_regionalBGC.git"  # PJB - temporary repo for testing regional-mom6 BGC.
                 command = f"git clone --branch {branch} --single-branch {url} {self.mom_run_dir} --depth 1"
                 print("Cloning with")
                 print(command)
