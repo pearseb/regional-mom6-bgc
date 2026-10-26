@@ -2562,7 +2562,11 @@ echo "Mosaic generation completed successfully."
 
         # Enable MOM6's generic-tracer interface for BGC experiments.
         if self.bgc_model is not None:
-            MOM_override_dict.setdefault("USE_generic_tracer", {})["value"] = True
+            MOM_override_dict["USE_generic_tracer"] = {
+                "value": True,
+                "comment": "Enable generic tracers package for BGC experiments",
+                "override": True,
+            }
         
         MOM_override_dict["MINIMUM_DEPTH"]["value"] = float(self.minimum_depth)
         MOM_override_dict["MAXIMUM_DEPTH"]["value"] = float(self.depth)

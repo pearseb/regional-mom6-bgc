@@ -1170,7 +1170,7 @@ class Segment:
             raise ValueError("Source timestamps must be unique.")
         # Daily timestamps within the range covered by the source data.
         daily_days = np.arange(
-            np.ceil(segment_out.time.values[0]),
+            0.0,
             np.floor(segment_out.time.values[-1]) + 1,
             dtype=float,
         )
