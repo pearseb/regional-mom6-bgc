@@ -2159,7 +2159,12 @@ class experiment:
 
             encoding = rgd.generate_encoding(
                 output,
-                {"time": {"dtype": "double"}},
+                {"time": {
+                    "dtype": "double", 
+                    "calendar": "gregorian", 
+                    "units": f"days since {self.date_range[0]}",
+                    }
+                },
                 default_fill_value=1.0e20,
             )
 
@@ -2565,6 +2570,16 @@ echo "Mosaic generation completed successfully."
             MOM_override_dict["USE_generic_tracer"] = {
                 "value": True,
                 "comment": "Enable generic tracers package for BGC experiments",
+                "override": True,
+            }
+            MOM_override_dict["GENERIC_TRACER_IC_FILE"] = {
+                "value": '"init_bgc_tracers.nc"',
+                "comment": "Set the initial conditions file for generic tracers",
+                "override": True,
+            }
+            MOM_override_dict["GENERIC_TRACER_IC_FILE_IS_Z"] = {
+                "value": True,
+                "comment": "Reads values by horizontal grid position and remaps vertically",
                 "override": True,
             }
         

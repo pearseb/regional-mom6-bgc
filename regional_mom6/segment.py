@@ -1145,8 +1145,11 @@ class Segment:
             raise ValueError(
                 f"Source time coordinate has no units. Attributes: {source_time.attrs}"
             )
-        # Preserve the source calendar.
-        calendar = source_calendar
+        # Use a calendar type supported by FMS
+        if source_calendar in ("standard", "gregorian", "proleptic_gregorian"):
+            calendar = "gregorian"
+        else:
+            calendar = source_calendar
         output_time_units = f"days since {startdate}"
         # Decode the original timestamps, then express them relative to startdate.
         source_dates = cftime.num2date(
@@ -1204,9 +1207,18 @@ class Segment:
                 if units is not None:
                     segment_out[v].attrs["units"] = units
 
-                segment_out[v] = try_pint_convert(
-                    segment_out[v], rgd.main_field_target_units[var], var
-                )
+                # Convert chlorophyll using the same convention as the ICs.
+                if var == "pchl":
+                    # First standardise the mass concentration units to make sure we are converting right afterwards.
+                    segment_out[v] = try_pint_convert(
+                        segment_out[v], "mg/m**3", var
+                    )
+                    segment_out[v] = segment_out[v] / 12.0 * 1.0e-6
+                    segment_out[v].attrs["units"] = "mol/L"
+                elif var in rgd.main_field_target_units:
+                    segment_out[v] = try_pint_convert(
+                        segment_out[v], rgd.main_field_target_units[var], var,
+                    )
 
             # Find out if the tracer has depth, and if so, what is it's z dimension (z dimension being a list is an edge case for MARBL BGC)
             variable_has_depth = False
