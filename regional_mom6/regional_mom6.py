@@ -11,6 +11,7 @@ import warnings
 import shutil
 import os
 import cftime
+import shlex
 import importlib.resources
 from importlib.metadata import version
 import urllib.request
@@ -2441,6 +2442,88 @@ class experiment:
             sep="\n\n",
         )
 
+    def write_FRE_tools_job(self, project, storage):
+        """Prepare the regional grid files and write a FRE-NCtools PBS script."""
+
+        input_dir = self.mom_input_dir.resolve()
+        bathymetry_path = input_dir / "bathymetry.nc"
+        hgrid_path = input_dir / "hgrid.nc"
+
+        for path in (bathymetry_path, hgrid_path):
+            if not path.is_file():
+                raise FileNotFoundError(f"Required grid file is missing: {path}")
+
+        # Load and close the files before modifying them.
+        with xr.open_dataset(bathymetry_path) as ds:
+            bathymetry = ds.load()
+
+        with xr.open_dataset(hgrid_path) as ds:
+            hgrid = ds.load()
+
+        # FRE-NCtools expects a tile dimension in the bathymetry.
+        if "ntiles" not in bathymetry.dims:
+            bathymetry = bathymetry.expand_dims({"ntiles": 1})
+            bathymetry.to_netcdf(bathymetry_path, mode="w")
+
+        # Describe the single regional grid tile.
+        if "tile" not in hgrid:
+            hgrid["tile"] = xr.DataArray(
+                np.array(b"tile1", dtype="|S255"),
+                attrs={
+                    "standard_name": "grid_tile_spec",
+                    "geometry": "spherical",
+                    "north_pole": "0.0 90.0",
+                    "discretization": "logically_rectangular",
+                    "conformal": "true",
+                },
+            )
+            hgrid.to_netcdf(
+                hgrid_path,
+                format="NETCDF3_64BIT",
+                mode="w",
+            )
+
+        script_path = input_dir / "make_mosaics.pbs"
+
+        script = f"""#!/bin/bash
+#PBS -N regional_mosaics
+#PBS -P {project}
+#PBS -q normal
+#PBS -l ncpus=1
+#PBS -l mem=4GB
+#PBS -l walltime=00:20:00
+#PBS -l storage={storage}
+#PBS -j oe
+
+set -e
+
+module use /g/data/vk83/modules
+module load model-tools/fre-nctools
+
+cd {shlex.quote(str(input_dir))}
+
+make_solo_mosaic \\
+    --num_tiles 1 \\
+    --dir . \\
+    --mosaic_name ocean_mosaic \\
+    --tile_file hgrid.nc
+
+make_quick_mosaic \\
+    --input_mosaic ocean_mosaic.nc \\
+    --mosaic_name grid_spec \\
+    --ocean_topog bathymetry.nc
+
+test -s ocean_mosaic.nc
+test -s grid_spec.nc
+
+echo "Mosaic generation completed successfully."
+"""
+
+        script_path.write_text(script)
+        print(f"Submit with: qsub {shlex.quote(str(script_path))}")
+
+        return script_path
+
     def setup_generic(self, ncpus=100, mask_land_cpus=True):
         """
         Set up the run directory for the model run. This is a multi step process - given that NUOPC vs FMS based runs are quite different, 
@@ -2477,6 +2560,10 @@ class experiment:
 
         MOM_override_dict = mpt.read_MOM_file_as_dict("MOM_override", self.mom_run_dir)
 
+        # Enable MOM6's generic-tracer interface for BGC experiments.
+        if self.bgc_model is not None:
+            MOM_override_dict.setdefault("USE_generic_tracer", {})["value"] = True
+        
         MOM_override_dict["MINIMUM_DEPTH"]["value"] = float(self.minimum_depth)
         MOM_override_dict["MAXIMUM_DEPTH"]["value"] = float(self.depth)
         # Define spatial dimensions
